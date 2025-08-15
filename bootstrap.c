@@ -3,6 +3,12 @@
 #include <stdlib.h>
 #include <stdbool.h>
 
+#if defined(__WIN32__)
+#define EXE(name) name ".exe"
+#else
+#define EXE(name) name
+#endif
+
 static const char *get_c_compiler(void) {
     const char *cc = getenv("CC");
     return (cc == NULL) ? "cc" : cc;
@@ -14,7 +20,110 @@ static void panic(const char *reason) {
 }
 
 #if defined(__WIN32__)
-#error TODO write the functionality for executing child process into this build script
+
+#include <windows.h>
+
+static bool needs_quoting(const char *arg) {
+    // Check if argument contains spaces or special characters that need quoting
+    return strchr(arg, ' ') != NULL || strchr(arg, '\t') != NULL || 
+           strchr(arg, '"') != NULL || strchr(arg, '\\') != NULL ||
+           strchr(arg, '&') != NULL || strchr(arg, '|') != NULL ||
+           strchr(arg, '<') != NULL || strchr(arg, '>') != NULL ||
+           strchr(arg, '^') != NULL || strchr(arg, '%') != NULL;
+}
+
+static void run(char **argv) {
+    static wchar_t cmdline[8000];
+    int i;
+    size_t pos = 0;
+    
+    // Build command line by concatenating arguments with spaces and selective quoting
+    cmdline[0] = L'\0';
+    
+    for (i = 0; argv[i] && pos < sizeof(cmdline)/sizeof(wchar_t) - 1; ++i) {
+        if (i > 0) {
+            if (pos < sizeof(cmdline)/sizeof(wchar_t) - 2) {
+                cmdline[pos++] = L' ';
+                cmdline[pos] = L'\0';
+            }
+        }
+        
+        const char *arg = argv[i];
+        bool quote_needed = needs_quoting(arg);
+        
+        // Add opening quote if needed
+        if (quote_needed && pos < sizeof(cmdline)/sizeof(wchar_t) - 1) {
+            cmdline[pos++] = L'"';
+            cmdline[pos] = L'\0';
+        }
+        
+        // Convert UTF-8 string to wide character
+        int wide_len = MultiByteToWideChar(CP_UTF8, 0, arg, -1, NULL, 0);
+        int space_needed = quote_needed ? 2 : 0; // space for quotes if needed
+        if (wide_len > 0 && pos + wide_len + space_needed < sizeof(cmdline)/sizeof(wchar_t) - 1) {
+            MultiByteToWideChar(CP_UTF8, 0, arg, -1, cmdline + pos, wide_len);
+            pos += wide_len - 1; // -1 because MultiByteToWideChar includes null terminator
+        }
+        
+        // Add closing quote if needed
+        if (quote_needed && pos < sizeof(cmdline)/sizeof(wchar_t) - 1) {
+            cmdline[pos++] = L'"';
+            cmdline[pos] = L'\0';
+        }
+    }
+        
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD exitCode;
+
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+
+    BOOL success = CreateProcessW(
+        NULL,        // lpApplicationName
+        cmdline,     // lpCommandLine
+        NULL,        // lpProcessAttributes
+        NULL,        // lpThreadAttributes
+        FALSE,       // bInheritHandles
+        0,           // dwCreationFlags
+        NULL,        // lpEnvironment
+        NULL,        // lpCurrentDirectory
+        &si,         // lpStartupInfo
+        &pi          // lpProcessInformation
+    );
+
+    if (!success) {
+        DWORD error = GetLastError();
+        // Convert wide string back to UTF-8 for debug output
+        int utf8_len = WideCharToMultiByte(CP_UTF8, 0, cmdline, -1, NULL, 0, NULL, NULL);
+        if (utf8_len > 0) {
+            char *utf8_cmdline = malloc(utf8_len);
+            if (utf8_cmdline) {
+                WideCharToMultiByte(CP_UTF8, 0, cmdline, -1, utf8_cmdline, utf8_len, NULL, NULL);
+                fprintf(stderr, "Command line: %s\n", utf8_cmdline);
+                free(utf8_cmdline);
+            }
+        }
+        fprintf(stderr, "CreateProcessW failed with error %lu\n", error);
+        panic("CreateProcessW failed");
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    if (!GetExitCodeProcess(pi.hProcess, &exitCode)) {
+        panic("GetExitCodeProcess failed");
+    }
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (exitCode != 0) {
+        panic("child process failed");
+    }
+}
+
+
 #else
 
 #include <unistd.h>
@@ -102,19 +211,21 @@ int main(int argc, char **argv) {
 
     {
         const char *child_argv[] = {
-            cc, "-o", "zig-wasm2c", "stage1/wasm2c.c", "-O2", "-std=c99", NULL,
+            cc, "-o", EXE("zig-wasm2c"), "stage1/wasm2c.c", "-O2", "-std=c99", NULL,
         };
         print_and_run(child_argv);
     }
     {
         const char *child_argv[] = {
-            "./zig-wasm2c", "stage1/zig1.wasm", "zig1.c", NULL,
+
+            EXE("./zig-wasm2c"), "stage1/zig1.wasm", "zig1.c", NULL,
+
         };
         print_and_run(child_argv);
     }
     {
         const char *child_argv[] = {
-            cc, "-o", "zig1", "zig1.c", "stage1/wasi.c", "-std=c99", "-Os", "-lm", NULL,
+            cc, "-o", EXE("zig1"), "zig1.c", "stage1/wasi.c", "-std=c99", "-Os", "-lm", NULL,
         };
         print_and_run(child_argv);
     }
@@ -151,7 +262,9 @@ int main(int argc, char **argv) {
 
     {
         const char *child_argv[] = {
-            "./zig1", "lib", "build-exe",
+
+            EXE("./zig1"), "lib", "build-exe",
+
             "-ofmt=c", "-lc", "-OReleaseSmall",
             "--name", "zig2", "-femit-bin=zig2.c",
             "-target", host_triple,
@@ -167,8 +280,8 @@ int main(int argc, char **argv) {
 
     {
         const char *child_argv[] = {
-            "./zig1", "lib", "build-obj",
-            "-ofmt=c", "-OReleaseSmall",
+            EXE("./zig1"), "lib", "build-obj",
+            "-ofmt=c", "-ODebug",
             "--name", "compiler_rt", "-femit-bin=compiler_rt.c",
             "-target", host_triple,
             "-Mroot=lib/compiler_rt.zig",
@@ -179,7 +292,7 @@ int main(int argc, char **argv) {
 
     {
         const char *child_argv[] = {
-            cc, "-o", "zig2", "zig2.c", "compiler_rt.c",
+            cc, "-o", EXE("zig2"), "zig2.c", "compiler_rt.c",
             "-std=c99", "-O2", "-fno-stack-protector",
             "-Istage1",
 #if defined(__APPLE__)
