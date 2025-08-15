@@ -11,6 +11,8 @@ const build_options = @import("build_options");
 const Cache = std.Build.Cache;
 const dev = @import("../dev.zig");
 
+const coff_import_lib = @import("../link/coff_import_lib.zig");
+
 pub const CrtFile = enum {
     crt2_o,
     dllcrt2_o,
@@ -225,6 +227,12 @@ fn addCrtCcArgs(
 }
 
 pub fn buildImportLib(comp: *Compilation, lib_name: []const u8) !void {
+    // Check if import library building is supported in current environment
+    if (!dev.env.supports(.build_import_lib)) {
+        log.debug("import library building not supported in {s} environment, skipping {s}.lib", .{ @tagName(dev.env), lib_name });
+        return;
+    }
+    
     dev.check(.build_import_lib);
 
     const gpa = comp.gpa;
@@ -290,11 +298,6 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8) !void {
     var o_dir = try comp.dirs.global_cache.handle.makeOpenPath(o_sub_path, .{});
     defer o_dir.close();
 
-    const final_def_basename = try std.fmt.allocPrint(arena, "{s}.def", .{lib_name});
-    const def_final_path = try comp.dirs.global_cache.join(arena, &[_][]const u8{
-        "o", &digest, final_def_basename,
-    });
-
     const aro = @import("aro");
     var aro_comp = aro.Compilation.init(gpa, std.fs.cwd());
     defer aro_comp.deinit();
@@ -309,7 +312,7 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8) !void {
         const stderr = std.fs.File.stderr().deprecatedWriter();
         nosuspend stderr.print("def file: {s}\n", .{def_file_path}) catch break :print;
         nosuspend stderr.print("include dir: {s}\n", .{include_dir}) catch break :print;
-        nosuspend stderr.print("output path: {s}\n", .{def_final_path}) catch break :print;
+        nosuspend stderr.print("output lib: {s}\n", .{final_lib_basename}) catch break :print;
     }
 
     try aro_comp.include_dirs.append(gpa, include_dir);
@@ -332,29 +335,30 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8) !void {
     }
 
     {
-        // new scope to ensure definition file is written before passing the path to WriteImportLibrary
-        const def_final_file = try o_dir.createFile(final_def_basename, .{ .truncate = true });
-        defer def_final_file.close();
-        try pp.prettyPrintTokens(def_final_file.deprecatedWriter(), .result_only);
+        // Generate the import library directly from preprocessed tokens in memory
+        var def_content = std.ArrayList(u8).init(arena);
+        defer def_content.deinit();
+        
+        // Write preprocessed def content to memory buffer
+        try pp.prettyPrintTokens(def_content.writer(), .result_only);
+        
+        // Create the final lib file and generate import library directly to it
+        const lib_final_file = try o_dir.createFile(final_lib_basename, .{ .truncate = true });
+        defer lib_final_file.close();
+        
+        // Convert target architecture to machine type for the import library generator
+        const machine_type = coff_import_lib.MachineType.fromTarget(target.*);
+        
+        // Generate import library directly from def content in memory to file
+        coff_import_lib.generateImportLibraryToWriter(arena, lib_final_file.deprecatedWriter(), def_content.items, machine_type)
+        catch |err| {
+            log.err("unable to turn {s}.def into {s}.lib: {s}", .{ lib_name, lib_name, @errorName(err) });
+            return error.WritingImportLibFailed;
+        };
     }
 
     const lib_final_path = try std.fs.path.join(gpa, &.{ "o", &digest, final_lib_basename });
     errdefer gpa.free(lib_final_path);
-
-    if (!build_options.have_llvm) return error.ZigCompilerNotBuiltWithLLVMExtensions;
-    const llvm_bindings = @import("../codegen/llvm/bindings.zig");
-    const def_final_path_z = try arena.dupeZ(u8, def_final_path);
-    const lib_final_path_z = try comp.dirs.global_cache.joinZ(arena, &.{lib_final_path});
-    if (llvm_bindings.WriteImportLibrary(
-        def_final_path_z.ptr,
-        @intFromEnum(target.toCoffMachine()),
-        lib_final_path_z.ptr,
-        true,
-    )) {
-        // TODO surface a proper error here
-        log.err("unable to turn {s}.def into {s}.lib", .{ lib_name, lib_name });
-        return error.WritingImportLibFailed;
-    }
 
     man.writeManifest() catch |err| {
         log.warn("failed to write cache manifest for DLL import {s}.lib: {s}", .{ lib_name, @errorName(err) });
@@ -370,6 +374,7 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8) !void {
         .lock = man.toOwnedLock(),
     });
 }
+
 
 pub fn libExists(
     allocator: Allocator,
