@@ -59,12 +59,12 @@ pub const ModuleDefinition = struct {
     version: ?[]const u8,
     exports: std.ArrayList(Export),
 
-    pub fn init(allocator: std.mem.Allocator) ModuleDefinition {
+    pub fn init() ModuleDefinition {
         return ModuleDefinition{
             .name = null,
             .description = null,
             .version = null,
-            .exports = std.ArrayList(Export).init(allocator),
+            .exports = .{},
         };
     }
 
@@ -76,7 +76,7 @@ pub const ModuleDefinition = struct {
         for (self.exports.items) |*exp| {
             exp.deinit(allocator);
         }
-        self.exports.deinit();
+        self.exports.deinit(allocator);
     }
 };
 
@@ -84,7 +84,7 @@ pub const ModuleDefinition = struct {
 pub fn parseDefFile(allocator: std.mem.Allocator, content: []const u8) !ModuleDefinition {
     var parser = DefParser.init(allocator);
     defer parser.deinit();
-    
+
     return parser.parse(content);
 }
 
@@ -112,7 +112,7 @@ pub const DefParser = struct {
     }
 
     pub fn parse(self: *DefParser, content: []const u8) !ModuleDefinition {
-        var module_def = ModuleDefinition.init(self.allocator);
+        var module_def = ModuleDefinition.init();
         errdefer module_def.deinit(self.allocator);
 
         var lines = std.mem.splitScalar(u8, content, '\n');
@@ -121,10 +121,10 @@ pub const DefParser = struct {
 
         while (lines.next()) |raw_line| {
             line_number += 1;
-            
+
             // Remove carriage return if present and trim whitespace
             const line = std.mem.trim(u8, std.mem.trimRight(u8, raw_line, "\r"), " \t");
-            
+
             // Skip empty lines and comments
             if (line.len == 0 or line[0] == ';') continue;
 
@@ -154,7 +154,7 @@ pub const DefParser = struct {
                     if (desc_part.len > 0) {
                         // Remove quotes if present
                         const desc = if (desc_part.len >= 2 and desc_part[0] == '"' and desc_part[desc_part.len - 1] == '"')
-                            desc_part[1..desc_part.len - 1]
+                            desc_part[1 .. desc_part.len - 1]
                         else
                             desc_part;
                         module_def.description = try self.allocator.dupe(u8, desc);
@@ -181,7 +181,7 @@ pub const DefParser = struct {
                     const export_entry = self.parseExportLine(line, line_number) catch |err| {
                         return err;
                     };
-                    try module_def.exports.append(export_entry);
+                    try module_def.exports.append(self.allocator, export_entry);
                 }
             } else {
                 // Unknown directive outside of known sections
@@ -204,12 +204,12 @@ pub const DefParser = struct {
         };
 
         // Split by whitespace and parse components
-        var parts = std.ArrayList([]const u8).init(self.allocator);
-        defer parts.deinit();
+        var parts: std.ArrayList([]const u8) = .{};
+        defer parts.deinit(self.allocator);
 
         var it = std.mem.tokenizeAny(u8, line, " \t");
         while (it.next()) |part| {
-            try parts.append(part);
+            try parts.append(self.allocator, part);
         }
 
         if (parts.items.len == 0) {
@@ -222,7 +222,7 @@ pub const DefParser = struct {
         if (std.mem.indexOf(u8, first_part, "=")) |eq_index| {
             // External=Internal format
             export_entry.name = try self.allocator.dupe(u8, first_part[0..eq_index]);
-            export_entry.internal_name = try self.allocator.dupe(u8, first_part[eq_index + 1..]);
+            export_entry.internal_name = try self.allocator.dupe(u8, first_part[eq_index + 1 ..]);
         } else {
             export_entry.name = try self.allocator.dupe(u8, first_part);
         }
@@ -262,7 +262,7 @@ pub const DefParser = struct {
 test "parse simple def file" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    
+
     const def_content =
         \\EXPORTS
         \\CreateFileA
@@ -270,10 +270,10 @@ test "parse simple def file" {
         \\ReadFile @1
         \\WriteFile @2 PRIVATE
     ;
-    
+
     var module_def = try parseDefFile(allocator, def_content);
     defer module_def.deinit(allocator);
-    
+
     try testing.expect(module_def.exports.items.len == 4);
     try testing.expectEqualStrings("CreateFileA", module_def.exports.items[0].name);
     try testing.expectEqualStrings("CreateFileW", module_def.exports.items[1].name);
@@ -284,7 +284,7 @@ test "parse simple def file" {
 test "parse def file with name and description" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    
+
     const def_content =
         \\NAME KERNEL32
         \\DESCRIPTION "Windows Kernel API"
@@ -292,10 +292,10 @@ test "parse def file with name and description" {
         \\EXPORTS
         \\CreateFileA
     ;
-    
+
     var module_def = try parseDefFile(allocator, def_content);
     defer module_def.deinit(allocator);
-    
+
     try testing.expectEqualStrings("KERNEL32", module_def.name.?);
     try testing.expectEqualStrings("Windows Kernel API", module_def.description.?);
     try testing.expectEqualStrings("10.0", module_def.version.?);

@@ -336,11 +336,11 @@ pub fn buildImportLib(comp: *Compilation, lib_name: []const u8) !void {
 
     {
         // Generate the import library directly from preprocessed tokens in memory
-        var def_content = std.ArrayList(u8).init(arena);
-        defer def_content.deinit();
+        var def_content : std.ArrayList(u8) = .empty;
+        defer def_content.deinit(arena);
         
         // Write preprocessed def content to memory buffer
-        try pp.prettyPrintTokens(def_content.writer(), .result_only);
+        try pp.prettyPrintTokens(def_content.writer(arena), .result_only);
         
         // Create the final lib file and generate import library directly to it
         const lib_final_file = try o_dir.createFile(final_lib_basename, .{ .truncate = true });
